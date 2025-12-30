@@ -74,6 +74,7 @@ class SoloudAudioPlayer {
     null,
   );
   final _seekSubject = PublishSubject<Duration>();
+  final _errorController = PublishSubject<Object>();
 
   Stream<ProcessingState> get processingStateStream =>
       _processingStateController.stream;
@@ -84,6 +85,7 @@ class SoloudAudioPlayer {
   Stream<Duration> get durationStream => _durationController.stream;
   Stream<AppAudioSource?> get currentSourceStream =>
       _currentSourceController.stream;
+  Stream<Object> get errorStream => _errorController.stream;
 
   ProcessingState get processingState => _processingStateController.value;
 
@@ -115,6 +117,43 @@ class SoloudAudioPlayer {
   bool _isFfmpegFinished = false;
 
   // --- Public Methods ---
+  Future<void> setEqualizer(List<double> gains) async {
+    if (gains.length != 8) {
+      log.warning('Equalizer requires exactly 8 bands');
+      return;
+    }
+    final filters = _soloud.filters;
+    if (filters.equalizerFilter.isActive == false) {
+      filters.equalizerFilter.activate();
+    }
+    final list = [
+      filters.equalizerFilter.band1,
+      filters.equalizerFilter.band2,
+      filters.equalizerFilter.band3,
+      filters.equalizerFilter.band4,
+      filters.equalizerFilter.band5,
+      filters.equalizerFilter.band6,
+      filters.equalizerFilter.band7,
+      filters.equalizerFilter.band8,
+    ];
+    for (int i = 0; i < 8; i++) {
+      final band = list[i];
+      final gain = gains[i];
+      if (band.value != gain) {
+        log.info("Setting band $i from ${band.value} to $gain");
+        band.fadeFilterParameter(to: gain, time: Duration(milliseconds: 200));
+      }
+    }
+  }
+
+  Future<void> init() async {
+    log.info('Initializing SoloudAudioPlayer');
+    await _soloud.init();
+    // Enable Equalizer Filter globally (index 0)
+    // _soloud.setGlobalFilter(FilterType.eq, FilterType.eq);
+    // Warmup FFmpeg
+    await FFmpegKit.executeAsync("--version");
+  }
 
   /// Internal callback for the current session
   Future<void> Function(AppAudioSource source)? _onCachedCallback;
@@ -143,6 +182,7 @@ class SoloudAudioPlayer {
     bool preload = false,
     Future<void> Function(AppAudioSource source)? onCached,
   }) async {
+    log.info('setSource: ${source.uri} (isLocal: ${source.isLocal})');
     await stop(); // Reset everything
 
     // Set the callback for this session
@@ -166,6 +206,7 @@ class SoloudAudioPlayer {
   }
 
   Future<void> play() async {
+    log.info('play() called. currentSource: ${currentSource?.uri}');
     if (currentSource == null) return;
 
     // If we are already ready/paused, just resume
@@ -181,6 +222,7 @@ class SoloudAudioPlayer {
   }
 
   Future<void> pause() async {
+    log.info('pause() called');
     if (_soundHandle != null) {
       _soloud.setPause(_soundHandle!, true);
       _isPlayingController.add(false);
@@ -189,6 +231,7 @@ class SoloudAudioPlayer {
 
   /// Seeking requires restarting the stream from the new offset
   Future<void> seek(Duration position) async {
+    log.info('seek() to $position');
     if (currentSource == null) return;
 
     // Update local state immediately for UI responsiveness
@@ -201,6 +244,7 @@ class SoloudAudioPlayer {
   }
 
   Future<void> stop() async {
+    log.info('stop() called');
     await _cleanup();
     _processingStateController.add(ProcessingState.idle);
     _isPlayingController.add(false);
@@ -210,6 +254,7 @@ class SoloudAudioPlayer {
   }
 
   Future<void> dispose() async {
+    log.info('dispose() called');
     await stop();
     await _processingStateController.close();
     await _isPlayingController.close();
@@ -218,6 +263,7 @@ class SoloudAudioPlayer {
     await _durationController.close();
     await _currentSourceController.close();
     await _seekSubject.close();
+    await _errorController.close();
   }
 
   // --- Core Logic ---
@@ -287,15 +333,21 @@ class SoloudAudioPlayer {
     final command =
         '-y -ss $startSec -i "${source.uri}" -vn -ac $_channels -ar $_sampleRate -f s16le -acodec pcm_s16le "$_outputPipe"';
 
-    log.warning(command);
+    log.info('FFmpeg command: $command');
 
-    await FFmpegKit.executeAsync(command, (session) async {
-      // Session Completed
-      _isFfmpegFinished = true;
-      if (_outputPipe != null) {
-        await FFmpegKitConfig.closeFFmpegPipe(_outputPipe!);
-      }
-    }, (logData) => log.warning(logData.getMessage()));
+    await FFmpegKit.executeAsync(
+      command,
+      (session) async {
+        // Session Completed
+        _isFfmpegFinished = true;
+        if (_outputPipe != null) {
+          await FFmpegKitConfig.closeFFmpegPipe(_outputPipe!);
+        }
+      },
+      (logData) {
+        log.fine('FFmpeg: ${logData.getMessage()}');
+      },
+    );
 
     // 5. Start Pumping Data
     unawaited(
@@ -316,8 +368,10 @@ class SoloudAudioPlayer {
       _isPlayingController.add(true);
       _processingStateController.add(ProcessingState.ready);
       _startTicker();
+      _startTicker();
     } catch (e) {
       log.warning('SoLoud Play Error: $e');
+      _errorController.add(e);
       _processingStateController.add(ProcessingState.idle);
     }
   }
@@ -412,7 +466,6 @@ class SoloudAudioPlayer {
       }
     } catch (e) {
       log.warning('Pump Error: $e');
-    } finally {
       await raf?.close();
       await cacheSink?.close();
     }
@@ -422,8 +475,8 @@ class SoloudAudioPlayer {
   void _startTicker() {
     _stateTicker?.cancel();
     _stateTicker = Timer.periodic(const Duration(milliseconds: 200), (_) {
-      log.info('Updating position');
-      log.info('Sound handle: ${_soundHandle}');
+      // log.finest('Updating position');
+      // log.finest('Sound handle: ${_soundHandle}');
       if (_soundHandle == null) return;
 
       if (_soloud.getIsValidVoiceHandle(_soundHandle!)) {
@@ -492,6 +545,7 @@ class SoloudAudioPlayer {
     }
   }
 
+  //data/user/0/com.smartdevice.speaker/files/cached_tracks/cache_aAkMkVFwAoo.pcm: Invalid data found when processing input
   Future<void> _playPcmFile(File file) async {
     await stop();
     _isPlayingController.add(true);
@@ -533,6 +587,7 @@ class SoloudAudioPlayer {
       _durationController.add(duration);
     } catch (e) {
       log.severe('Error playing PCM file: $e');
+      _errorController.add(e);
       await stop();
     }
   }
