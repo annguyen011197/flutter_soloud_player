@@ -54,7 +54,7 @@ class SoloudAudioPlayer {
     ) async {
       final source = currentSource;
       if (source != null) {
-        await _seek(source, startOffset: position);
+        _seek(source, startOffset: position);
       }
     });
   }
@@ -183,7 +183,8 @@ class SoloudAudioPlayer {
     Future<void> Function(AppAudioSource source)? onCached,
   }) async {
     log.info('setSource: ${source.uri} (isLocal: ${source.isLocal})');
-    await stop(); // Reset everything
+    print("SoloudPlayer: setSource ${source.id} (isLocal = ${source.isLocal})");
+    await stop(keepMetadata: false); // Reset everything
 
     // Set the callback for this session
     _onCachedCallback = onCached;
@@ -192,7 +193,7 @@ class SoloudAudioPlayer {
 
     if (source.isLocal) {
       if (source.uri.endsWith('.pcm')) {
-        unawaited(_playPcmFile(File(source.uri)));
+        await _playPcmFile(File(source.uri));
         return;
       }
     }
@@ -207,6 +208,7 @@ class SoloudAudioPlayer {
 
   Future<void> play() async {
     log.info('play() called. currentSource: ${currentSource?.uri}');
+    print("SoloudPlayer: play called ${currentSource?.id}");
     if (currentSource == null) return;
 
     // If we are already ready/paused, just resume
@@ -217,12 +219,19 @@ class SoloudAudioPlayer {
       return;
     }
 
+    if (_processingStateController.value == ProcessingState.loading ||
+        _processingStateController.value == ProcessingState.buffering ||
+        playing) {
+      return;
+    }
+
     // Otherwise, start a fresh stream
-    await _seek(currentSource!, startOffset: _seekOffset);
+    _seek(currentSource!, startOffset: _seekOffset);
   }
 
   Future<void> pause() async {
     log.info('pause() called');
+    print("SoloudPlayer: pause $_soundHandle");
     if (_soundHandle != null) {
       _soloud.setPause(_soundHandle!, true);
       _isPlayingController.add(false);
@@ -231,11 +240,14 @@ class SoloudAudioPlayer {
 
   /// Seeking requires restarting the stream from the new offset
   Future<void> seek(Duration position) async {
-    log.info('seek() to $position');
+    print("SoloudPlayer: seek() to $position");
     if (currentSource == null) return;
 
+    //Temporary allow seek only when loaded completed
+    if (_streamDataState != StreamDataState.fullyLoaded) return;
+
     // Update local state immediately for UI responsiveness
-    _seekOffset = position;
+    // _seekOffset = position;
     _positionController.add(position);
     _bufferedPositionController.add(position); // Buffer resets at seek point
 
@@ -243,9 +255,9 @@ class SoloudAudioPlayer {
     _seekSubject.add(position);
   }
 
-  Future<void> stop() async {
+  Future<void> stop({bool keepMetadata = true}) async {
     log.info('stop() called');
-    await _cleanup();
+    await _cleanup(keepMetadata: keepMetadata);
     _processingStateController.add(ProcessingState.idle);
     _isPlayingController.add(false);
     _positionController.add(Duration.zero);
@@ -255,7 +267,7 @@ class SoloudAudioPlayer {
 
   Future<void> dispose() async {
     log.info('dispose() called');
-    await stop();
+    await stop(keepMetadata: false);
     await _processingStateController.close();
     await _isPlayingController.close();
     await _positionController.close();
@@ -267,7 +279,7 @@ class SoloudAudioPlayer {
   }
 
   // --- Core Logic ---
-
+  String? _seekOperationId;
   Future<void> _seek(
     AppAudioSource source, {
     Duration startOffset = Duration.zero,
@@ -280,12 +292,14 @@ class SoloudAudioPlayer {
       // Local files usually fast enough with FFmpeg, but memory buffer seek is instanant
       // Optimization applies mainly to prevent re-downloading/re-processing
       // For local files, FFmpeg restart is also fast, but native seek is better.
-      final relativePosition = startOffset - _seekOffset;
-      _soloud.seek(_soundHandle!, relativePosition);
+      // final relativePosition = startOffset - _seekOffset;
+      print("SoloudPlayer: _seek() called $_soundHandle ${startOffset}");
+      _soloud.seek(_soundHandle!, startOffset);
       _positionController.add(startOffset);
       return;
     }
-
+    String localOperationId = DateTime.now().millisecondsSinceEpoch.toString();
+    _seekOperationId = localOperationId;
     // 2. Set Loading State
     _processingStateController.add(ProcessingState.loading);
 
@@ -339,6 +353,9 @@ class SoloudAudioPlayer {
       command,
       (session) async {
         // Session Completed
+        print(
+          "SoloudPlayer: play - fromStream - ffmpeg completed ${session.getReturnCode()}",
+        );
         _isFfmpegFinished = true;
         if (_outputPipe != null) {
           await FFmpegKitConfig.closeFFmpegPipe(_outputPipe!);
@@ -346,6 +363,9 @@ class SoloudAudioPlayer {
       },
       (logData) {
         log.fine('FFmpeg: ${logData.getMessage()}');
+        print(
+          "SoloudPlayer: play - fromStream - ffmpeg log ${logData.getMessage()}",
+        );
       },
     );
 
@@ -364,13 +384,18 @@ class SoloudAudioPlayer {
 
     // 7. Play
     try {
+      // Check if this seek is still valid
+      if (_seekOperationId != localOperationId) return;
       _soundHandle = await _soloud.play(_audioSource!);
+      print("SoloudPlayer: play - fromStream ${source.id} $_soundHandle");
       _isPlayingController.add(true);
       _processingStateController.add(ProcessingState.ready);
       _startTicker();
-      _startTicker();
     } catch (e) {
       log.warning('SoLoud Play Error: $e');
+      print(
+        "SoloudPlayer: play - fromStream - error ${e} ${source.id} $_soundHandle",
+      );
       _errorController.add(e);
       _processingStateController.add(ProcessingState.idle);
     }
@@ -388,6 +413,9 @@ class SoloudAudioPlayer {
           _streamDataState == StreamDataState.buffering &&
           retries < 20) {
         try {
+          print(
+            "SoloudPlayer: play - fromStream - open pipe ${file.path} ${file.existsSync()}",
+          );
           raf = await file.open();
         } catch (_) {
           await Future<void>.delayed(const Duration(milliseconds: 100));
@@ -482,6 +510,9 @@ class SoloudAudioPlayer {
       if (_soloud.getIsValidVoiceHandle(_soundHandle!)) {
         // 1. Update Playback Position
         final currentPos = _soloud.getPosition(_soundHandle!);
+        print(
+          "SoloudPlayer: play - fromStream - currentPos  $_seekOffset + $currentPos = ${_seekOffset + currentPos}",
+        );
         _positionController.add(_seekOffset + currentPos);
 
         // 2. Sync Play/Pause state from engine (optional safety)
@@ -527,6 +558,7 @@ class SoloudAudioPlayer {
     if (_soundHandle != null) {
       // Trying to stop an invalid handle might throw, so we ignore
       try {
+        print("SoloudPlayer: stop $_soundHandle");
         await _soloud.stop(_soundHandle!);
       } catch (_) {}
       _soundHandle = null;
@@ -547,10 +579,11 @@ class SoloudAudioPlayer {
 
   //data/user/0/com.smartdevice.speaker/files/cached_tracks/cache_aAkMkVFwAoo.pcm: Invalid data found when processing input
   Future<void> _playPcmFile(File file) async {
-    await stop();
+    await stop(keepMetadata: true);
     _isPlayingController.add(true);
     _streamDataState =
         StreamDataState.fullyLoaded; // It's local, so instant load
+    _processingStateController.add(ProcessingState.loading);
 
     try {
       _audioSource = _soloud.setBufferStream(
@@ -559,8 +592,10 @@ class SoloudAudioPlayer {
         sampleRate: _sampleRate,
         onBuffering: (_, __, ___) {},
       );
-
+      _processingStateController.add(ProcessingState.ready);
+      print("SoloudPlayer: play - fromPCM ${file.uri} $_soundHandle");
       _soundHandle = await _soloud.play(_audioSource!);
+      print("SoloudPlayer: play $_soundHandle");
       _startTicker();
 
       // Read file and push chunks
