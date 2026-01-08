@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit_config.dart';
-import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_https/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_https/ffmpeg_kit_config.dart';
+import 'package:ffmpeg_kit_flutter_new_https/ffprobe_kit.dart';
 import 'package:flutter_soloud/flutter_soloud.dart';
 import 'package:logging/logging.dart';
 import 'package:path_provider/path_provider.dart';
