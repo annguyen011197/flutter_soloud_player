@@ -155,6 +155,11 @@ class SoloudAudioPlayer {
     await FFmpegKit.executeAsync("--version");
   }
 
+  Future<void> reinit() async {
+    _soloud.deinit();
+    await _soloud.init();
+  }
+
   /// Internal callback for the current session
   Future<void> Function(AppAudioSource source)? _onCachedCallback;
 
