@@ -105,6 +105,7 @@ class SoloudAudioPlayer {
   SoLoud get _soloud => SoLoud.instance;
   String? _outputPipe;
   AudioSource? _audioSource;
+  StreamSubscription? _audioSourceEvent;
   SoundHandle? _soundHandle;
 
   StreamDataState _streamDataState = StreamDataState.idle;
@@ -213,7 +214,7 @@ class SoloudAudioPlayer {
 
   Future<void> play() async {
     log.info('play() called. currentSource: ${currentSource?.uri}');
-    print("SoloudPlayer: play called ${currentSource?.id}");
+    log.info("SoloudPlayer: play called ${currentSource?.id}");
     if (currentSource == null) return;
 
     // If we are already ready/paused, just resume
@@ -236,7 +237,7 @@ class SoloudAudioPlayer {
 
   Future<void> pause() async {
     log.info('pause() called');
-    print("SoloudPlayer: pause $_soundHandle");
+    log.info("SoloudPlayer: pause $_soundHandle");
     if (_soundHandle != null) {
       _soloud.setPause(_soundHandle!, true);
       _isPlayingController.add(false);
@@ -245,7 +246,7 @@ class SoloudAudioPlayer {
 
   /// Seeking requires restarting the stream from the new offset
   Future<void> seek(Duration position) async {
-    print("SoloudPlayer: seek() to $position");
+    log.info("SoloudPlayer: seek() to $position");
     if (currentSource == null) return;
 
     //Temporary allow seek only when loaded completed
@@ -298,7 +299,7 @@ class SoloudAudioPlayer {
       // Optimization applies mainly to prevent re-downloading/re-processing
       // For local files, FFmpeg restart is also fast, but native seek is better.
       // final relativePosition = startOffset - _seekOffset;
-      print("SoloudPlayer: _seek() called $_soundHandle ${startOffset}");
+      log.info("SoloudPlayer: _seek() called $_soundHandle ${startOffset}");
       _soloud.seek(_soundHandle!, startOffset);
       _positionController.add(startOffset);
       return;
@@ -345,7 +346,6 @@ class SoloudAudioPlayer {
         }
       },
     );
-
     // 4. Start FFmpeg with Seek (-ss)
     // -ss must be BEFORE -i for fast seek
     final startSec = startOffset.inMilliseconds / 1000.0;
@@ -358,7 +358,7 @@ class SoloudAudioPlayer {
       command,
       (session) async {
         // Session Completed
-        print(
+        log.info(
           "SoloudPlayer: play - fromStream - ffmpeg completed ${session.getReturnCode()}",
         );
         _isFfmpegFinished = true;
@@ -368,7 +368,7 @@ class SoloudAudioPlayer {
       },
       (logData) {
         log.fine('FFmpeg: ${logData.getMessage()}');
-        print(
+        log.info(
           "SoloudPlayer: play - fromStream - ffmpeg log ${logData.getMessage()}",
         );
       },
@@ -392,13 +392,13 @@ class SoloudAudioPlayer {
       // Check if this seek is still valid
       if (_seekOperationId != localOperationId) return;
       _soundHandle = await _soloud.play(_audioSource!);
-      print("SoloudPlayer: play - fromStream ${source.id} $_soundHandle");
+      log.info("SoloudPlayer: play - fromStream ${source.id} $_soundHandle");
       _isPlayingController.add(true);
       _processingStateController.add(ProcessingState.ready);
       _startTicker();
     } catch (e) {
       log.warning('SoLoud Play Error: $e');
-      print(
+      log.info(
         "SoloudPlayer: play - fromStream - error ${e} ${source.id} $_soundHandle",
       );
       _errorController.add(e);
@@ -418,7 +418,7 @@ class SoloudAudioPlayer {
           _streamDataState == StreamDataState.buffering &&
           retries < 20) {
         try {
-          print(
+          log.info(
             "SoloudPlayer: play - fromStream - open pipe ${file.path} ${file.existsSync()}",
           );
           raf = await file.open();
@@ -466,7 +466,7 @@ class SoloudAudioPlayer {
           _bufferedPositionController.add(_seekOffset + bufferedDuration);
         }
       }
-
+      log.info("StreamData end");
       // If we exited the loop normally (and didn't error/cleanup), we are fully loaded
       if (_streamDataState == StreamDataState.buffering) {
         _streamDataState = StreamDataState.fullyLoaded;
@@ -511,28 +511,36 @@ class SoloudAudioPlayer {
       // log.finest('Updating position');
       // log.finest('Sound handle: ${_soundHandle}');
       if (_soundHandle == null) return;
-
+      bool isFinished = false;
       if (_soloud.getIsValidVoiceHandle(_soundHandle!)) {
         // 1. Update Playback Position
         final currentPos = _soloud.getPosition(_soundHandle!);
-        print(
+        log.info(
           "SoloudPlayer: play - fromStream - currentPos  $_seekOffset + $currentPos = ${_seekOffset + currentPos}",
         );
-        _positionController.add(_seekOffset + currentPos);
+        final actualPos = _seekOffset + currentPos;
+        _positionController.add(actualPos);
 
         // 2. Sync Play/Pause state from engine (optional safety)
         final isPaused = _soloud.getPause(_soundHandle!);
+
         if (isPaused != !_isPlayingController.value) {
           _isPlayingController.add(!isPaused);
         }
+
+        isFinished = actualPos >= _durationController.value;
       } else {
-        // Handle Invalid -> Playback Stopped
-        // If FFmpeg is also done, we are truly completed.
-        if (_streamDataState != StreamDataState.buffering) {
-          _processingStateController.add(ProcessingState.completed);
-          _isPlayingController.add(false);
-          _stateTicker?.cancel();
-        }
+        isFinished = true;
+      }
+
+      if (isFinished) {
+        // Handle Invalid or position at end -> Playback Stopped
+        // If FFmpeg is also done, we are truly completed. -> don't need check
+        // if (_streamDataState != StreamDataState.buffering) {}
+
+        _processingStateController.add(ProcessingState.completed);
+        _isPlayingController.add(false);
+        _stateTicker?.cancel();
       }
     });
   }
@@ -571,9 +579,11 @@ class SoloudAudioPlayer {
 
     if (_audioSource != null) {
       try {
-        await _soloud.disposeAllSources();
+        await _soloud.disposeSource(_audioSource!);
+        await _audioSourceEvent?.cancel();
       } catch (_) {}
       _audioSource = null;
+      _audioSourceEvent = null;
     }
 
     if (!keepMetadata) {
@@ -598,9 +608,9 @@ class SoloudAudioPlayer {
         onBuffering: (_, __, ___) {},
       );
       _processingStateController.add(ProcessingState.ready);
-      print("SoloudPlayer: play - fromPCM ${file.uri} $_soundHandle");
+      log.info("SoloudPlayer: play - fromPCM ${file.uri} $_soundHandle");
       _soundHandle = await _soloud.play(_audioSource!);
-      print("SoloudPlayer: play $_soundHandle");
+      log.info("SoloudPlayer: play $_soundHandle");
       _startTicker();
 
       // Read file and push chunks
