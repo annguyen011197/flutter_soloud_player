@@ -157,6 +157,7 @@ class SoloudAudioPlayerInstances {
       if (_soloud.getPause(_soundHandle!)) {
         _soloud.setPause(_soundHandle!, false);
         _isPlayingController.add(true);
+        _startTicker();
       }
       return;
     }
@@ -181,6 +182,7 @@ class SoloudAudioPlayerInstances {
     if (_soundHandle != null && _soloud.getIsValidVoiceHandle(_soundHandle!)) {
       _soloud.setPause(_soundHandle!, true);
       _isPlayingController.add(false);
+      _stateTicker?.cancel();
     }
   }
 
@@ -237,8 +239,12 @@ class SoloudAudioPlayerInstances {
       if (_soundHandle == null) return;
 
       if (_soloud.getIsValidVoiceHandle(_soundHandle!)) {
-        final currentPos = _soloud.getPosition(_soundHandle!);
-        _positionController.add(currentPos);
+        // Only update stream if someone is listening
+        if (_positionController.hasListener) {
+          final currentPos = _soloud.getPosition(_soundHandle!);
+          _positionController.add(currentPos);
+          log.info("Current position: $currentPos");
+        }
 
         // Sync pause state just in case
         final isPaused = _soloud.getPause(_soundHandle!);
@@ -246,7 +252,7 @@ class SoloudAudioPlayerInstances {
           _isPlayingController.add(!isPaused);
         }
 
-        log.info("Current position: $currentPos - isPlaying: ${!isPaused}");
+        log.info("isPlaying: ${!isPaused}");
       } else {
         // Handle finished
         if (_processingStateController.value != ProcessingState.completed &&

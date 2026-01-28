@@ -222,6 +222,7 @@ class SoloudAudioPlayer {
         _soundHandle != null) {
       _soloud.setPause(_soundHandle!, false);
       _isPlayingController.add(true);
+      _startTicker();
       return;
     }
 
@@ -241,6 +242,7 @@ class SoloudAudioPlayer {
     if (_soundHandle != null) {
       _soloud.setPause(_soundHandle!, true);
       _isPlayingController.add(false);
+      _stateTicker?.cancel();
     }
   }
 
@@ -514,12 +516,15 @@ class SoloudAudioPlayer {
       bool isFinished = false;
       if (_soloud.getIsValidVoiceHandle(_soundHandle!)) {
         // 1. Update Playback Position
-        final currentPos = _soloud.getPosition(_soundHandle!);
-        log.info(
-          "SoloudPlayer: play - fromStream - currentPos  $_seekOffset + $currentPos = ${_seekOffset + currentPos}",
-        );
-        final actualPos = _seekOffset + currentPos;
-        _positionController.add(actualPos);
+        Duration actualPos = _positionController.value;
+        if (_positionController.hasListener) {
+          final currentPos = _soloud.getPosition(_soundHandle!);
+          log.info(
+            "SoloudPlayer: play - fromStream - currentPos  $_seekOffset + $currentPos = ${_seekOffset + currentPos}",
+          );
+          actualPos = _seekOffset + currentPos;
+          _positionController.add(actualPos);
+        }
 
         // 2. Sync Play/Pause state from engine (optional safety)
         final isPaused = _soloud.getPause(_soundHandle!);
