@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new_https/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_https/session_state.dart';
 import 'package:ffmpeg_kit_flutter_new_https/ffmpeg_kit_config.dart';
 import 'package:ffmpeg_kit_flutter_new_https/ffprobe_kit.dart';
 import 'package:flutter_soloud/flutter_soloud.dart';
+import 'package:flutter_soloud_player/src/ffmpeg_stream_service.dart';
 import 'package:logging/logging.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:rxdart/rxdart.dart';
@@ -103,6 +105,8 @@ class SoloudAudioPlayer {
 
   // --- Internal State ---
   SoLoud get _soloud => SoLoud.instance;
+  final FFmpegStreamService _ffmpegService = FFmpegStreamService();
+  StreamSession? _currentStreamSession;
   String? _outputPipe;
   AudioSource? _audioSource;
   StreamSubscription? _audioSourceEvent;
@@ -200,6 +204,9 @@ class SoloudAudioPlayer {
     if (source.isLocal) {
       if (source.uri.endsWith('.pcm')) {
         await _playPcmFile(File(source.uri));
+        return;
+      } else if (source.uri.endsWith('.wav')) {
+        await _playWavFile(File(source.uri));
         return;
       }
     }
@@ -319,18 +326,15 @@ class SoloudAudioPlayer {
     _streamDataState = StreamDataState.buffering;
     _ffmpegReadyCompleter = Completer<void>();
     _isFfmpegFinished = false;
-    _outputPipe = await FFmpegKitConfig.registerNewFFmpegPipe();
 
     // Setup cache sink if applicable
-    IOSink? cacheSink;
     File? tempCacheFile;
     if (startOffset == Duration.zero && !source.isLocal) {
       try {
         final tempDir = await getTemporaryDirectory();
-        tempCacheFile = File('${tempDir.path}/cache_${source.id}.pcm.tmp');
-        cacheSink = tempCacheFile.openWrite();
+        tempCacheFile = File('${tempDir.path}/cache_${source.id}.wav.tmp');
       } catch (e) {
-        log.warning('Failed to create cache sink: $e');
+        log.warning('Failed to create cache file path: $e');
       }
     }
 
@@ -348,38 +352,34 @@ class SoloudAudioPlayer {
         }
       },
     );
-    // 4. Start FFmpeg with Seek (-ss)
+    // 4. Start FFmpeg with StreamService (Tee Muxer)
     // -ss must be BEFORE -i for fast seek
-    final startSec = startOffset.inMilliseconds / 1000.0;
-    final command =
-        '-y -ss $startSec -i "${source.uri}" -vn -ac $_channels -ar $_sampleRate -f s16le -acodec pcm_s16le "$_outputPipe"';
-
-    log.info('FFmpeg command: $command');
-
-    await FFmpegKit.executeAsync(
-      command,
-      (session) async {
-        // Session Completed
+    if (startOffset == Duration.zero && tempCacheFile != null) {
+      // Full stream with caching
+      _currentStreamSession = await _ffmpegService.streamAndCache(
+        source.uri,
+        tempCacheFile.path,
+      );
+      _outputPipe = _currentStreamSession!.pipePath;
+    } else {
+      _outputPipe = await FFmpegKitConfig.registerNewFFmpegPipe();
+      final startSec = startOffset.inMilliseconds / 1000.0;
+      final command =
+          '-y -ss $startSec -i "${source.uri}" -vn -ac $_channels -ar $_sampleRate -f s16le -acodec pcm_s16le "$_outputPipe"';
+      log.info('FFmpeg command (SEEK): $command');
+      await FFmpegKit.executeAsync(command, (session) async {
         log.info(
-          "SoloudPlayer: play - fromStream - ffmpeg completed ${session.getReturnCode()}",
+          "SoloudPlayer: seek session completed ${session.getReturnCode()}",
         );
         _isFfmpegFinished = true;
         if (_outputPipe != null) {
           await FFmpegKitConfig.closeFFmpegPipe(_outputPipe!);
         }
-      },
-      (logData) {
-        log.fine('FFmpeg: ${logData.getMessage()}');
-        log.info(
-          "SoloudPlayer: play - fromStream - ffmpeg log ${logData.getMessage()}",
-        );
-      },
-    );
+      });
+    }
 
     // 5. Start Pumping Data
-    unawaited(
-      _pumpAudioData(cacheSink: cacheSink, tempCacheFile: tempCacheFile),
-    );
+    unawaited(_pumpAudioData(tempCacheFile: tempCacheFile));
 
     // 6. Wait for initial data before playing
     // This prevents "Voice not found" errors if we play too fast
@@ -409,7 +409,7 @@ class SoloudAudioPlayer {
   }
 
   /// The loop that moves data from FFmpeg pipe to SoLoud buffer
-  Future<void> _pumpAudioData({IOSink? cacheSink, File? tempCacheFile}) async {
+  Future<void> _pumpAudioData({File? tempCacheFile}) async {
     final file = File(_outputPipe!);
     RandomAccessFile? raf;
 
@@ -438,10 +438,19 @@ class SoloudAudioPlayer {
         final chunk = await raf.read(16384);
 
         if (chunk.isEmpty) {
-          // If FFmpeg is finished and we got empty chunk, it's EOF.
-          if (_isFfmpegFinished) {
+          // Check if session is actually finished
+          if (_currentStreamSession != null) {
+            final state = await _currentStreamSession!.session.getState();
+            if (state == SessionState.completed ||
+                state == SessionState.failed) {
+              _isFfmpegFinished = true;
+              break;
+            }
+          } else if (_isFfmpegFinished) {
+            // Fallback for manual seek command
             break;
           }
+
           // Otherwise, FFmpeg is thinking/downloading, wait bit
           await Future<void>.delayed(const Duration(milliseconds: 20));
           continue;
@@ -455,9 +464,6 @@ class SoloudAudioPlayer {
 
         if (_audioSource != null) {
           _soloud.addAudioDataStream(_audioSource!, chunk);
-
-          // Write to cache if active
-          cacheSink?.add(chunk);
 
           // Track buffered bytes for "Gray Bar"
           _bytesBuffered += chunk.length;
@@ -473,28 +479,30 @@ class SoloudAudioPlayer {
       if (_streamDataState == StreamDataState.buffering) {
         _streamDataState = StreamDataState.fullyLoaded;
 
-        // Finalize Cache
-        if (cacheSink != null && tempCacheFile != null) {
-          await cacheSink.flush();
-          await cacheSink.close();
-          cacheSink = null; // Prevent double close in finally
+        // Finalize Cache (Tee Muxer handles writing, we just rename)
+        if (tempCacheFile != null && _currentStreamSession != null) {
+          // Wait for FFmpeg to fully close the file handle
+          // _isFfmpegFinished might be true, but filesystem might lag slightly.
+          await Future<void>.delayed(const Duration(milliseconds: 100));
 
-          // Rename .tmp to .pcm
-          final pcmPath = tempCacheFile.path.replaceAll('.tmp', '');
-          final pcmFile = await tempCacheFile.rename(pcmPath);
-          log.info('PCM Cached: $pcmPath');
+          // Rename .wav.tmp to .wav
+          final wavPath = tempCacheFile.path.replaceAll('.tmp', '');
+          final wavFile = await tempCacheFile.rename(wavPath);
+          log.info('WAV Cached: $wavPath');
 
           if (_onCachedCallback != null) {
             final cachedSource = AppAudioSource(
-              uri: pcmFile.path,
+              uri: wavFile.path,
               id: currentSource?.id ?? 'unknown',
               isLocal: true,
             );
             await _onCachedCallback!(cachedSource);
             // Auto-delete after callback returns
-            if (pcmFile.existsSync()) {
-              await pcmFile.delete();
-              log.info('PCM Cache deleted after callback');
+            if (wavFile.existsSync()) {
+              // Optional: Keep it? The requirement implies Caching for reuse.
+              // Existing code deleted it. I'll stick to existing behavior unless asked.
+              await wavFile.delete();
+              log.info('WAV Cache deleted after callback');
             }
           }
         }
@@ -502,7 +510,6 @@ class SoloudAudioPlayer {
     } catch (e) {
       log.warning('Pump Error: $e');
       await raf?.close();
-      await cacheSink?.close();
     }
   }
 
@@ -568,6 +575,12 @@ class SoloudAudioPlayer {
   Future<void> _cleanup({bool keepMetadata = false}) async {
     _streamDataState = StreamDataState.idle; // Stop the pump loop
     _stateTicker?.cancel();
+
+    // Cancel current stream session if active
+    if (_currentStreamSession != null) {
+      await _currentStreamSession!.cancel();
+      _currentStreamSession = null;
+    }
 
     if (_outputPipe != null) {
       await FFmpegKitConfig.closeFFmpegPipe(_outputPipe!);
@@ -642,6 +655,32 @@ class SoloudAudioPlayer {
       _durationController.add(duration);
     } catch (e) {
       log.severe('Error playing PCM file: $e');
+      _errorController.add(e);
+      await stop();
+    }
+  }
+
+  Future<void> _playWavFile(File file) async {
+    await stop(keepMetadata: true);
+    _isPlayingController.add(true);
+    _streamDataState = StreamDataState.fullyLoaded;
+    _processingStateController.add(ProcessingState.loading);
+
+    try {
+      _audioSource = await _soloud.loadFile(file.path);
+      if (_audioSource case final audioSource?) {
+        _soundHandle = await _soloud.play(audioSource);
+
+        // Calculate duration from file size (minus header)
+        final len = await file.length();
+        final duration = _soloud.getLength(audioSource);
+        _durationController.add(duration);
+        _startTicker();
+      } else {
+        throw Exception("Failed to load audio source");
+      }
+    } catch (e) {
+      log.severe('Error playing WAV file: $e');
       _errorController.add(e);
       await stop();
     }
