@@ -384,7 +384,7 @@ class SoloudAudioPlayer {
     // 6. Wait for initial data before playing
     // This prevents "Voice not found" errors if we play too fast
     try {
-      await _ffmpegReadyCompleter?.future.timeout(const Duration(seconds: 10));
+      await _ffmpegReadyCompleter?.future.timeout(const Duration(seconds: 1));
     } catch (e) {
       return;
     }
@@ -675,6 +675,10 @@ class SoloudAudioPlayer {
         final len = await file.length();
         final duration = _soloud.getLength(audioSource);
         _durationController.add(duration);
+
+        // Update state to ready so playback is valid
+        _processingStateController.add(ProcessingState.ready);
+
         _startTicker();
       } else {
         throw Exception("Failed to load audio source");
