@@ -63,6 +63,8 @@ class FFmpegStreamService {
 
     _log.info('Executing FFmpeg command: $command');
 
+    final errorController = StreamController<Object>();
+
     // 3. Execute Async
     // We don't await the completion here because it's a stream.
     // We return the session so the caller can manage it.
@@ -73,10 +75,13 @@ class FFmpegStreamService {
         if (returnCode != null && returnCode.isValueSuccess()) {
           _log.info('FFmpeg process completed successfully.');
         } else {
-          _log.warning('FFmpeg process failed with rc=$returnCode');
+          final msg = 'FFmpeg process failed with rc=$returnCode';
+          _log.warning(msg);
+          errorController.add(Exception(msg));
         }
         // Always close the pipe when session ends
         await FFmpegKitConfig.closeFFmpegPipe(pipePath);
+        await errorController.close();
       },
       (log) {
         // Optional: Filter logs
@@ -88,7 +93,70 @@ class FFmpegStreamService {
       },
     );
 
-    return StreamSession(pipePath: pipePath, session: session);
+    return StreamSession(
+      pipePath: pipePath,
+      session: session,
+      errorStream: errorController.stream,
+    );
+  }
+
+  /// Starts the FFMPEG stream without caching.
+  ///
+  /// [url] is the input audio URL.
+  /// [startOffset] is the position to start streaming from.
+  ///
+  /// Returns a [StreamSession] containing the pipe path and the FFmpeg session.
+  Future<StreamSession> streamNotCache(
+    String url, {
+    Duration startOffset = Duration.zero,
+  }) async {
+    // 1. Create a Named Pipe
+    final pipePath = await FFmpegKitConfig.registerNewFFmpegPipe();
+    if (pipePath == null) {
+      throw Exception('Failed to create FFmpeg pipe');
+    }
+    _log.info('Created pipe: $pipePath');
+
+    // 2. Construct the FFMPEG command
+    final startSec = startOffset.inMilliseconds / 1000.0;
+
+    // -y: Overwrite output files without asking
+    // -ss: Seek to position (placed before -i for fast seek)
+    // -i "$url": Input URL
+    // -vn: Disable video recording
+    // -ac 2: Stereo channels
+    // -ar 44100: 44.1kHz sample rate
+    // -f s16le: Force format s16le (raw PCM)
+    // -acodec pcm_s16le: Audio codec
+
+    final command =
+        '-y -ss $startSec -i "$url" -vn -ac 2 -ar 44100 -f s16le -acodec pcm_s16le "$pipePath"';
+
+    _log.info('Executing FFmpeg command (streamNotCache): $command');
+
+    final errorController = StreamController<Object>();
+
+    // 3. Execute Async
+    final session = await FFmpegKit.executeAsync(command, (session) async {
+      final returnCode = await session.getReturnCode();
+      if (returnCode != null && returnCode.isValueSuccess()) {
+        _log.info('FFmpeg process (streamNotCache) completed successfully.');
+      } else {
+        final msg =
+            'FFmpeg process (streamNotCache) failed with rc=$returnCode';
+        _log.warning(msg);
+        errorController.add(Exception(msg));
+      }
+      // Always close the pipe when session ends
+      await FFmpegKitConfig.closeFFmpegPipe(pipePath);
+      await errorController.close();
+    });
+
+    return StreamSession(
+      pipePath: pipePath,
+      session: session,
+      errorStream: errorController.stream,
+    );
   }
 }
 
@@ -96,8 +164,13 @@ class FFmpegStreamService {
 class StreamSession {
   final String pipePath;
   final Session session;
+  final Stream<Object> errorStream;
 
-  StreamSession({required this.pipePath, required this.session});
+  StreamSession({
+    required this.pipePath,
+    required this.session,
+    required this.errorStream,
+  });
 
   /// Cancels the FFmpeg session and cleans up the pipe.
   Future<void> cancel() async {
@@ -105,47 +178,3 @@ class StreamSession {
     await FFmpegKitConfig.closeFFmpegPipe(pipePath);
   }
 }
-
-/*
-/// Usage Snippet for SoloudAudioPlayer:
-///
-/// ```dart
-/// final ffmpegService = FFmpegStreamService();
-///
-/// // Start the stream
-/// final cacheDir = await getTemporaryDirectory();
-/// final cachePath = '${cacheDir.path}/track_${id}.wav';
-/// final streamSession = await ffmpegService.streamAndCache(url, cachePath);
-///
-/// // Consume the PCM data from the pipe
-/// final pipeFile = File(streamSession.pipePath);
-/// 
-/// // Wait for pipe to be ready (FFmpeg takes a moment to open it)
-/// RandomAccessFile? raf;
-/// int retries = 0;
-/// while (raf == null && retries < 20) {
-///   try {
-///     raf = await pipeFile.open();
-///   } catch (_) {
-///     await Future.delayed(const Duration(milliseconds: 100));
-///     retries++;
-///   }
-/// }
-///
-/// if (raf != null) {
-///   // Read loop
-///   while (active) {
-///      final chunk = await raf.read(16384);
-///      if (chunk.isEmpty) {
-///         // Check if session finished
-///         if (await streamSession.session.getState() == SessionState.completed) break;
-///         await Future.delayed(const Duration(milliseconds: 20));
-///         continue;
-///      }
-///      // Feed to player
-///      soloud.addAudioDataStream(source, chunk);
-///   }
-///   await raf.close();
-/// }
-/// ```
-*/

@@ -107,6 +107,7 @@ class SoloudAudioPlayer {
   SoLoud get _soloud => SoLoud.instance;
   final FFmpegStreamService _ffmpegService = FFmpegStreamService();
   StreamSession? _currentStreamSession;
+  StreamSubscription? _ffmpegErrorSubscription;
   String? _outputPipe;
   AudioSource? _audioSource;
   StreamSubscription? _audioSourceEvent;
@@ -233,6 +234,12 @@ class SoloudAudioPlayer {
       return;
     }
 
+    if (_processingStateController.value == ProcessingState.idle) {
+      // If playback is completed, reset to beginning and start over
+      _seek(currentSource!, startOffset: Duration.zero);
+      return;
+    }
+
     if (_processingStateController.value == ProcessingState.loading ||
         _processingStateController.value == ProcessingState.buffering ||
         playing) {
@@ -354,28 +361,37 @@ class SoloudAudioPlayer {
     );
     // 4. Start FFmpeg with StreamService (Tee Muxer)
     // -ss must be BEFORE -i for fast seek
-    if (startOffset == Duration.zero && tempCacheFile != null) {
-      // Full stream with caching
-      _currentStreamSession = await _ffmpegService.streamAndCache(
-        source.uri,
-        tempCacheFile.path,
-      );
-      _outputPipe = _currentStreamSession!.pipePath;
-    } else {
-      _outputPipe = await FFmpegKitConfig.registerNewFFmpegPipe();
-      final startSec = startOffset.inMilliseconds / 1000.0;
-      final command =
-          '-y -ss $startSec -i "${source.uri}" -vn -ac $_channels -ar $_sampleRate -f s16le -acodec pcm_s16le "$_outputPipe"';
-      log.info('FFmpeg command (SEEK): $command');
-      await FFmpegKit.executeAsync(command, (session) async {
-        log.info(
-          "SoloudPlayer: seek session completed ${session.getReturnCode()}",
+    try {
+      if (startOffset == Duration.zero && tempCacheFile != null) {
+        // Full stream with caching
+        _currentStreamSession = await _ffmpegService.streamAndCache(
+          source.uri,
+          tempCacheFile.path,
         );
-        _isFfmpegFinished = true;
-        if (_outputPipe != null) {
-          await FFmpegKitConfig.closeFFmpegPipe(_outputPipe!);
-        }
+      } else {
+        _currentStreamSession = await _ffmpegService.streamNotCache(
+          source.uri,
+          startOffset: startOffset,
+        );
+      }
+
+      // Listen for FFmpeg errors
+      _ffmpegErrorSubscription?.cancel();
+      _ffmpegErrorSubscription = _currentStreamSession?.errorStream.listen((
+        error,
+      ) {
+        log.severe('FFmpeg error: $error');
+        _errorController.add(error);
+        _processingStateController.add(ProcessingState.idle);
       });
+
+      _outputPipe = _currentStreamSession!.pipePath;
+    } catch (e) {
+      log.severe('FFmpeg start error: $e');
+      _errorController.add(e);
+      _processingStateController.add(ProcessingState.idle);
+      _streamDataState = StreamDataState.idle;
+      return;
     }
 
     // 5. Start Pumping Data
@@ -581,6 +597,8 @@ class SoloudAudioPlayer {
       await _currentStreamSession!.cancel();
       _currentStreamSession = null;
     }
+    await _ffmpegErrorSubscription?.cancel();
+    _ffmpegErrorSubscription = null;
 
     if (_outputPipe != null) {
       await FFmpegKitConfig.closeFFmpegPipe(_outputPipe!);
