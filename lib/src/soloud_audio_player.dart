@@ -8,6 +8,7 @@ import 'package:ffmpeg_kit_flutter_new_https/ffprobe_kit.dart';
 import 'package:flutter_soloud/flutter_soloud.dart';
 import 'package:flutter_soloud_player/src/ffmpeg_stream_service.dart';
 import 'package:logging/logging.dart';
+import 'package:on_audio_query/on_audio_query.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:rxdart/rxdart.dart';
 
@@ -43,6 +44,14 @@ enum StreamDataState {
 
 class AppAudioSource {
   AppAudioSource({required this.uri, required this.id, this.isLocal = false});
+
+  factory AppAudioSource.fromSongModel(SongModel song) {
+    return AppAudioSource(
+      uri: song.data,
+      id: song.id.toString(),
+      isLocal: true,
+    );
+  }
 
   final String uri;
   final String id;
@@ -188,13 +197,27 @@ class SoloudAudioPlayer {
     await setSource(source);
   }
 
+  Future<void> setSong(
+    SongModel song, {
+    bool preload = false,
+    Future<void> Function(AppAudioSource source)? onCached,
+  }) async {
+    await setSource(
+      AppAudioSource.fromSongModel(song),
+      preload: preload,
+      onCached: onCached,
+    );
+  }
+
   Future<void> setSource(
     AppAudioSource source, {
     bool preload = false,
     Future<void> Function(AppAudioSource source)? onCached,
   }) async {
     log.info('setSource: ${source.uri} (isLocal: ${source.isLocal})');
-    print("SoloudPlayer: setSource ${source.id} (isLocal = ${source.isLocal})");
+    log.info(
+      'SoloudPlayer: setSource ${source.id} (isLocal = ${source.isLocal})',
+    );
     await stop(keepMetadata: false); // Reset everything
 
     // Set the callback for this session
@@ -203,13 +226,18 @@ class SoloudAudioPlayer {
     _currentSourceController.add(source);
 
     if (source.isLocal) {
-      if (source.uri.endsWith('.pcm')) {
-        await _playPcmFile(File(source.uri));
+      final File localFile = File(source.uri);
+      final String lowerCaseUri = source.uri.toLowerCase();
+      if (lowerCaseUri.endsWith('.pcm')) {
+        await _playPcmFile(localFile);
         return;
-      } else if (source.uri.endsWith('.wav')) {
-        await _playWavFile(File(source.uri));
+      } else if (lowerCaseUri.endsWith('.wav')) {
+        await _playWavFile(localFile, preload: preload);
         return;
       }
+
+      await _playLocalFile(localFile, preload: preload);
+      return;
     }
 
     // Fetch duration async (doesn't block UI)
@@ -225,12 +253,26 @@ class SoloudAudioPlayer {
     log.info("SoloudPlayer: play called ${currentSource?.id}");
     if (currentSource == null) return;
 
+    if (_processingStateController.value == ProcessingState.completed &&
+        currentSource?.isLocal == true &&
+        _audioSource != null) {
+      await _playLoadedLocalSource();
+      return;
+    }
+
     // If we are already ready/paused, just resume
     if (_processingStateController.value == ProcessingState.ready &&
         _soundHandle != null) {
       _soloud.setPause(_soundHandle!, false);
       _isPlayingController.add(true);
       _startTicker();
+      return;
+    }
+
+    if (_processingStateController.value == ProcessingState.ready &&
+        currentSource?.isLocal == true &&
+        _audioSource != null) {
+      await _playLoadedLocalSource();
       return;
     }
 
@@ -306,18 +348,15 @@ class SoloudAudioPlayer {
     AppAudioSource source, {
     Duration startOffset = Duration.zero,
   }) async {
-    // 1. Optimize: If fully loaded and seeking forward within buffer, use native seek
+    // Use native seek when the current source is already fully loaded in SoLoud.
     if (_streamDataState == StreamDataState.fullyLoaded &&
         _soundHandle != null &&
-        startOffset >= _seekOffset &&
-        !source.isLocal) {
-      // Local files usually fast enough with FFmpeg, but memory buffer seek is instanant
-      // Optimization applies mainly to prevent re-downloading/re-processing
-      // For local files, FFmpeg restart is also fast, but native seek is better.
-      // final relativePosition = startOffset - _seekOffset;
-      log.info("SoloudPlayer: _seek() called $_soundHandle ${startOffset}");
+        _soloud.getIsValidVoiceHandle(_soundHandle!)) {
+      log.info("SoloudPlayer: _seek() called $_soundHandle $startOffset");
       _soloud.seek(_soundHandle!, startOffset);
       _positionController.add(startOffset);
+      _bufferedPositionController.add(startOffset);
+      _seekOffset = Duration.zero;
       return;
     }
     String localOperationId = DateTime.now().millisecondsSinceEpoch.toString();
@@ -417,7 +456,7 @@ class SoloudAudioPlayer {
     } catch (e) {
       log.warning('SoLoud Play Error: $e');
       log.info(
-        "SoloudPlayer: play - fromStream - error ${e} ${source.id} $_soundHandle",
+        "SoloudPlayer: play - fromStream - error $e ${source.id} $_soundHandle",
       );
       _errorController.add(e);
       _processingStateController.add(ProcessingState.idle);
@@ -641,7 +680,7 @@ class SoloudAudioPlayer {
         maxBufferSizeBytes: 1024 * 1024 * 100, // 100MB
         channels: Channels.stereo,
         sampleRate: _sampleRate,
-        onBuffering: (_, __, ___) {},
+        onBuffering: (_, handle, time) {},
       );
       _processingStateController.add(ProcessingState.ready);
       log.info("SoloudPlayer: play - fromPCM ${file.uri} $_soundHandle");
@@ -678,26 +717,23 @@ class SoloudAudioPlayer {
     }
   }
 
-  Future<void> _playWavFile(File file) async {
+  Future<void> _playWavFile(File file, {bool preload = false}) async {
     await stop(keepMetadata: true);
-    _isPlayingController.add(true);
     _streamDataState = StreamDataState.fullyLoaded;
     _processingStateController.add(ProcessingState.loading);
 
     try {
       _audioSource = await _soloud.loadFile(file.path);
       if (_audioSource case final audioSource?) {
-        _soundHandle = await _soloud.play(audioSource);
-
-        // Calculate duration from file size (minus header)
-        final len = await file.length();
         final duration = _soloud.getLength(audioSource);
         _durationController.add(duration);
 
         // Update state to ready so playback is valid
         _processingStateController.add(ProcessingState.ready);
 
-        _startTicker();
+        if (!preload) {
+          await _playLoadedLocalSource();
+        }
       } else {
         throw Exception("Failed to load audio source");
       }
@@ -705,6 +741,50 @@ class SoloudAudioPlayer {
       log.severe('Error playing WAV file: $e');
       _errorController.add(e);
       await stop();
+    }
+  }
+
+  Future<void> _playLocalFile(File file, {required bool preload}) async {
+    await stop(keepMetadata: true);
+    _streamDataState = StreamDataState.fullyLoaded;
+    _processingStateController.add(ProcessingState.loading);
+
+    try {
+      _audioSource = await _soloud.loadFile(file.path);
+      if (_audioSource case final audioSource?) {
+        _durationController.add(_soloud.getLength(audioSource));
+        _processingStateController.add(ProcessingState.ready);
+
+        if (!preload) {
+          await _playLoadedLocalSource();
+        }
+      } else {
+        throw Exception('Failed to load local audio source');
+      }
+    } catch (e) {
+      log.severe('Error playing local file: $e');
+      _errorController.add(e);
+      await stop();
+    }
+  }
+
+  Future<void> _playLoadedLocalSource() async {
+    if (_audioSource == null) return;
+
+    try {
+      if (_soundHandle != null &&
+          _soloud.getIsValidVoiceHandle(_soundHandle!)) {
+        await _soloud.stop(_soundHandle!);
+      }
+
+      _soundHandle = await _soloud.play(_audioSource!);
+      _isPlayingController.add(true);
+      _processingStateController.add(ProcessingState.ready);
+      _startTicker();
+    } catch (e) {
+      log.severe('Error starting local playback: $e');
+      _errorController.add(e);
+      _processingStateController.add(ProcessingState.idle);
     }
   }
 }
